@@ -1,0 +1,4 @@
+yfinance==0.2.51
+pandas==2.2.3
+numpy==1.26.4
+# pandas-ta added in Phase 3 for chart pattern detection.

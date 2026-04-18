@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code local config (may contain paths to unrelated local projects)
+.claude/
+
+# Local secrets (should never exist — project is 100% free/no-key, but just in case)
+.env
+.env.local
+
+# Never commit personal portfolio data
+portfolio.json
+holdings.json
