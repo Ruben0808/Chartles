@@ -10,9 +10,9 @@ Phase 1 scaffolding — Nifty 50 scanner + static dashboard reading `data/stocks
 
 ## Stack
 
-- **Scanner**: Python 3.11, `yfinance`, `pandas-ta`, `pandas` — no API keys, no paid services
+- **Scanner**: Python 3.11, `jugaad-data` (direct NSE access, no API keys), `pandas`
 - **Dashboard**: Next.js 14 static export on GitHub Pages
-- **Scheduling**: GitHub Actions, nightly after NSE close (~4pm IST)
+- **Scheduling**: GitHub Actions, nightly after NSE close (~4:30pm IST)
 - **Data storage**: JSON files in `data/`, committed each scan
 
 ## Run locally
@@ -37,10 +37,6 @@ npm run dev
 ```
 
 Open http://localhost:3000.
-
-## Known issues
-
-- **yfinance can be rate-limited from residential IPs.** Yahoo sometimes returns an HTML block page instead of JSON, causing all symbols to fail. This typically resolves on its own, and works reliably from GitHub Actions' IP pool. If it persists locally, the next step is swapping to [`jugaad-data`](https://github.com/jugaad-py/jugaad-data) which hits NSE directly — will be added if the issue becomes chronic.
 
 ## Roadmap
 

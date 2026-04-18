@@ -1,10 +1,9 @@
 """
 Chartles Phase 1 scanner.
 
-Pulls 1y of OHLCV for each symbol in universe/nifty50.txt via yfinance,
-computes a technical health score, writes ../data/stocks.json.
-
-No API keys, no paid services.
+Pulls 1y of OHLCV for each symbol in universe/nifty50.txt via jugaad-data
+(direct NSE access, no API keys, no Yahoo dependency), computes a technical
+health score, writes ../data/stocks.json.
 """
 from __future__ import annotations
 
@@ -12,17 +11,23 @@ import json
 import sys
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from jugaad_data.nse import stock_df
 
 SCANNER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCANNER_DIR.parent
 UNIVERSE_FILE = SCANNER_DIR / "universe" / "nifty50.txt"
 OUT_FILE = REPO_ROOT / "data" / "stocks.json"
+
+# jugaad-data has a cache-dir race in its thread pool (os.makedirs without exist_ok).
+# Pre-create the dirs so all worker threads find them already present.
+for _cache in ("nsehistory-stock", "nsehistory-index"):
+    (Path.home() / "Library" / "Caches" / _cache).mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".cache" / _cache).mkdir(parents=True, exist_ok=True)
 
 TIERS = [
     (80, "Stable"),
@@ -58,22 +63,25 @@ def load_universe() -> list[str]:
 
 
 def fetch_ohlcv(symbol: str) -> pd.DataFrame | None:
-    """yfinance uses .NS suffix for NSE equities."""
-    ticker = f"{symbol}.NS"
+    """Pull 1y daily OHLCV from NSE via jugaad-data. Returns columns Open/High/Low/Close/Volume."""
     try:
-        df = yf.download(
-            ticker,
-            period="1y",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-        if df.empty or len(df) < 60:
+        end = date.today()
+        start = end - timedelta(days=400)  # extra buffer for holidays/weekends
+        df = stock_df(symbol=symbol, from_date=start, to_date=end, series="EQ")
+        if df is None or df.empty or len(df) < 60:
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+        df = df.rename(
+            columns={
+                "OPEN": "Open",
+                "HIGH": "High",
+                "LOW": "Low",
+                "CLOSE": "Close",
+                "VOLUME": "Volume",
+            }
+        )
+        df["DATE"] = pd.to_datetime(df["DATE"])
+        df = df.sort_values("DATE").reset_index(drop=True)
+        return df[["DATE", "Open", "High", "Low", "Close", "Volume"]].set_index("DATE")
     except Exception as e:
         print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
         return None
