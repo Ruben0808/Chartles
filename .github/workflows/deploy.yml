@@ -36,10 +36,6 @@ jobs:
 
       - name: Build static export
         working-directory: web
-        env:
-          # Set to your repo name for GitHub Pages project sites.
-          # e.g. NEXT_PUBLIC_BASE_PATH=/chartles
-          NEXT_PUBLIC_BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
         run: npm run build
 
       - uses: actions/configure-pages@v4
