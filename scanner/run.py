@@ -1,17 +1,20 @@
 """
 Chartles Phase 1 scanner.
 
-Hits NSE's official historical API directly with a cookie-primed
-curl_cffi Chrome-impersonating session. No intermediary libraries;
-full control over timeouts. Computes a technical health score and
+Downloads NSE's official daily bhavcopy CSVs (one file per trading day
+containing OHLCV for every listed equity) from the public archives
+subdomain, aggregates per symbol, computes a technical health score,
 writes ../data/stocks.json.
+
+Bhavcopy is NSE's canonical data distribution — stable URL for years,
+no auth/cookies, no anti-scraping. One request per day, 50 symbols per
+response = far more efficient than per-symbol API calls.
 """
 from __future__ import annotations
 
+import io
 import json
 import sys
-import time
-import urllib.parse
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,32 +28,93 @@ REPO_ROOT = SCANNER_DIR.parent
 UNIVERSE_FILE = SCANNER_DIR / "universe" / "nifty50.txt"
 OUT_FILE = REPO_ROOT / "data" / "stocks.json"
 
-NSE_BASE = "https://www.nseindia.com"
-NSE_HISTORICAL_API = f"{NSE_BASE}/api/historical/cm/equity"
+BHAV_URLS = (
+    "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{d}.csv",
+    "https://archives.nseindia.com/products/content/sec_bhavdata_full_{d}.csv",
+)
 
 _session: curl_requests.Session | None = None
 
 
 def _get_session() -> curl_requests.Session:
-    """Return a session with NSE cookies primed. Built lazily + cached."""
     global _session
     if _session is not None:
         return _session
-    s = curl_requests.Session(impersonate="chrome", timeout=15)
-    s.headers.update({
-        "Accept": "application/json, text/plain, */*",
+    _session = curl_requests.Session(impersonate="chrome", timeout=15)
+    _session.headers.update({
+        "Accept": "text/csv,*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": NSE_BASE + "/",
+        "Referer": "https://www.nseindia.com/",
     })
-    # Prime cookies — NSE won't serve /api/ without a valid session token
-    # gathered from visiting the homepage first.
-    for url in (NSE_BASE + "/", NSE_BASE + "/get-quotes/equity?symbol=RELIANCE"):
+    return _session
+
+
+def fetch_bhavcopy(d: date) -> pd.DataFrame | None:
+    """One day's bhavcopy CSV. Returns None on holiday/404."""
+    session = _get_session()
+    tag = d.strftime("%d%m%Y")
+    for pattern in BHAV_URLS:
+        url = pattern.format(d=tag)
         try:
-            s.get(url)
+            r = session.get(url)
         except Exception as e:
-            print(f"  session prime failed for {url}: {e}", file=sys.stderr)
-    _session = s
-    return s
+            print(f"  bhavcopy {tag}: {e}", file=sys.stderr)
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            df = pd.read_csv(io.StringIO(r.text))
+        except Exception as e:
+            print(f"  bhavcopy parse {tag}: {e}", file=sys.stderr)
+            continue
+        df.columns = [c.strip() for c in df.columns]
+        return df
+    return None
+
+
+def fetch_all_bhavcopies(start: date, end: date) -> pd.DataFrame:
+    """Concat every bhavcopy in [start, end], skipping weekends/holidays."""
+    frames: list[pd.DataFrame] = []
+    d = start
+    days_tried = 0
+    days_ok = 0
+    while d <= end:
+        if d.weekday() < 5:  # skip Sat/Sun
+            days_tried += 1
+            df = fetch_bhavcopy(d)
+            if df is not None:
+                frames.append(df)
+                days_ok += 1
+        d += timedelta(days=1)
+    print(f"  bhavcopy: {days_ok}/{days_tried} trading days fetched")
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def extract_symbol(all_df: pd.DataFrame, symbol: str) -> pd.DataFrame | None:
+    if all_df.empty:
+        return None
+    mask = (all_df["SYMBOL"] == symbol) & (all_df["SERIES"] == "EQ")
+    sub = all_df[mask].copy()
+    if sub.empty or len(sub) < 60:
+        return None
+    sub = sub.rename(
+        columns={
+            "DATE1": "Date",
+            "OPEN_PRICE": "Open",
+            "HIGH_PRICE": "High",
+            "LOW_PRICE": "Low",
+            "CLOSE_PRICE": "Close",
+            "TTL_TRD_QNTY": "Volume",
+        }
+    )
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        sub[col] = pd.to_numeric(sub[col], errors="coerce")
+    sub["Date"] = pd.to_datetime(sub["Date"], format="%d-%b-%Y", errors="coerce")
+    sub = sub.dropna(subset=["Date", "Close"]).sort_values("Date").set_index("Date")
+    sub = sub[["Open", "High", "Low", "Close", "Volume"]]
+    if len(sub) < 60:
+        return None
+    return sub
 
 TIERS = [
     (80, "Stable"),
@@ -85,56 +149,8 @@ def load_universe() -> list[str]:
     return [s.strip() for s in UNIVERSE_FILE.read_text().splitlines() if s.strip()]
 
 
-def fetch_ohlcv(symbol: str) -> pd.DataFrame | None:
-    """Pull ~1y daily OHLCV from NSE's /api/historical/cm/equity endpoint."""
-    session = _get_session()
-    end = date.today()
-    start = end - timedelta(days=365)
-    params = {
-        "symbol": symbol,
-        "series": '["EQ"]',
-        "from": start.strftime("%d-%m-%Y"),
-        "to": end.strftime("%d-%m-%Y"),
-    }
-    qs = urllib.parse.urlencode(params, safe='[]"')
-    url = f"{NSE_HISTORICAL_API}?{qs}"
-
-    try:
-        r = session.get(url)
-        if r.status_code != 200:
-            print(f"  {symbol}: HTTP {r.status_code}", file=sys.stderr)
-            return None
-        payload = r.json()
-    except Exception as e:
-        print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
-        return None
-
-    records = payload.get("data") if isinstance(payload, dict) else None
-    if not records:
-        return None
-
-    df = pd.DataFrame(records)
-    if "CH_TIMESTAMP" not in df.columns or "CH_CLOSING_PRICE" not in df.columns:
-        return None
-
-    df = df.rename(
-        columns={
-            "CH_TIMESTAMP": "Date",
-            "CH_OPENING_PRICE": "Open",
-            "CH_TRADE_HIGH_PRICE": "High",
-            "CH_TRADE_LOW_PRICE": "Low",
-            "CH_CLOSING_PRICE": "Close",
-            "CH_TOT_TRADED_QTY": "Volume",
-        }
-    )
-    for col in ("Open", "High", "Low", "Close", "Volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["Date"] = pd.to_datetime(df["Date"])
-    df = df.dropna(subset=["Close"]).sort_values("Date").set_index("Date")
-    df = df[["Open", "High", "Low", "Close", "Volume"]]
-    if len(df) < 60:
-        return None
-    return df
+# fetch_ohlcv is no longer per-symbol — we fetch all bhavcopies once upfront
+# and extract each symbol's slice from the merged DataFrame. See main().
 
 
 def tier_for(score: int) -> str:
@@ -300,21 +316,29 @@ def main() -> int:
     symbols = load_universe()
     print(f"scanning {len(symbols)} symbols...")
 
+    end = date.today()
+    start = end - timedelta(days=420)  # ~1y of trading days + weekend/holiday buffer
+    print(f"downloading bhavcopies {start} → {end}...")
+    all_df = fetch_all_bhavcopies(start, end)
+    if all_df.empty:
+        print("no bhavcopy data fetched — aborting", file=sys.stderr)
+        return 1
+
     rows: list[dict] = []
     failed: list[str] = []
 
     for i, sym in enumerate(symbols, 1):
-        print(f"[{i}/{len(symbols)}] {sym}")
-        df = fetch_ohlcv(sym)
-        if df is None:
+        sub = extract_symbol(all_df, sym)
+        if sub is None:
+            print(f"[{i}/{len(symbols)}] {sym} — insufficient data")
             failed.append(sym)
             continue
-        row = score_stock(sym, df)
+        row = score_stock(sym, sub)
         if row is None:
             failed.append(sym)
             continue
+        print(f"[{i}/{len(symbols)}] {sym} → {row.tier} ({row.score})")
         rows.append(asdict(row))
-        time.sleep(0.3)
 
     rows.sort(key=lambda r: r["score"], reverse=True)
 

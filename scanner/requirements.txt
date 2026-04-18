@@ -1,4 +1,3 @@
-yfinance==0.2.51
 curl-cffi==0.7.4
 pandas==2.2.3
 numpy==1.26.4
