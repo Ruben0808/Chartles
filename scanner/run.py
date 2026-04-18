@@ -1,22 +1,23 @@
 """
 Chartles Phase 1 scanner.
 
-Pulls 1y of OHLCV for each symbol via yfinance with curl_cffi browser
-impersonation (defeats Yahoo's TLS-fingerprint anti-scraping), computes a
-technical health score, writes ../data/stocks.json.
+Hits NSE's official historical API directly with a cookie-primed
+curl_cffi Chrome-impersonating session. No intermediary libraries;
+full control over timeouts. Computes a technical health score and
+writes ../data/stocks.json.
 """
 from __future__ import annotations
 
 import json
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from curl_cffi import requests as curl_requests
 
 SCANNER_DIR = Path(__file__).resolve().parent
@@ -24,9 +25,32 @@ REPO_ROOT = SCANNER_DIR.parent
 UNIVERSE_FILE = SCANNER_DIR / "universe" / "nifty50.txt"
 OUT_FILE = REPO_ROOT / "data" / "stocks.json"
 
-# curl_cffi session with Chrome TLS fingerprint — lets yfinance through
-# Yahoo's anti-scraping which blocks vanilla urllib/requests.
-_session = curl_requests.Session(impersonate="chrome", timeout=15)
+NSE_BASE = "https://www.nseindia.com"
+NSE_HISTORICAL_API = f"{NSE_BASE}/api/historical/cm/equity"
+
+_session: curl_requests.Session | None = None
+
+
+def _get_session() -> curl_requests.Session:
+    """Return a session with NSE cookies primed. Built lazily + cached."""
+    global _session
+    if _session is not None:
+        return _session
+    s = curl_requests.Session(impersonate="chrome", timeout=15)
+    s.headers.update({
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_BASE + "/",
+    })
+    # Prime cookies — NSE won't serve /api/ without a valid session token
+    # gathered from visiting the homepage first.
+    for url in (NSE_BASE + "/", NSE_BASE + "/get-quotes/equity?symbol=RELIANCE"):
+        try:
+            s.get(url)
+        except Exception as e:
+            print(f"  session prime failed for {url}: {e}", file=sys.stderr)
+    _session = s
+    return s
 
 TIERS = [
     (80, "Stable"),
@@ -62,18 +86,55 @@ def load_universe() -> list[str]:
 
 
 def fetch_ohlcv(symbol: str) -> pd.DataFrame | None:
-    """Pull 1y daily OHLCV from Yahoo via yfinance + curl_cffi (browser TLS)."""
+    """Pull ~1y daily OHLCV from NSE's /api/historical/cm/equity endpoint."""
+    session = _get_session()
+    end = date.today()
+    start = end - timedelta(days=365)
+    params = {
+        "symbol": symbol,
+        "series": '["EQ"]',
+        "from": start.strftime("%d-%m-%Y"),
+        "to": end.strftime("%d-%m-%Y"),
+    }
+    qs = urllib.parse.urlencode(params, safe='[]"')
+    url = f"{NSE_HISTORICAL_API}?{qs}"
+
     try:
-        ticker = yf.Ticker(f"{symbol}.NS", session=_session)
-        df = ticker.history(period="1y", auto_adjust=True)
-        if df is None or df.empty or len(df) < 60:
+        r = session.get(url)
+        if r.status_code != 200:
+            print(f"  {symbol}: HTTP {r.status_code}", file=sys.stderr)
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df[["Open", "High", "Low", "Close", "Volume"]]
+        payload = r.json()
     except Exception as e:
         print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
         return None
+
+    records = payload.get("data") if isinstance(payload, dict) else None
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    if "CH_TIMESTAMP" not in df.columns or "CH_CLOSING_PRICE" not in df.columns:
+        return None
+
+    df = df.rename(
+        columns={
+            "CH_TIMESTAMP": "Date",
+            "CH_OPENING_PRICE": "Open",
+            "CH_TRADE_HIGH_PRICE": "High",
+            "CH_TRADE_LOW_PRICE": "Low",
+            "CH_CLOSING_PRICE": "Close",
+            "CH_TOT_TRADED_QTY": "Volume",
+        }
+    )
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.dropna(subset=["Close"]).sort_values("Date").set_index("Date")
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+    if len(df) < 60:
+        return None
+    return df
 
 
 def tier_for(score: int) -> str:
