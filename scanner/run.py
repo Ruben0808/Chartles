@@ -68,6 +68,9 @@ def fetch_bhavcopy(d: date) -> pd.DataFrame | None:
             print(f"  bhavcopy parse {tag}: {e}", file=sys.stderr)
             continue
         df.columns = [c.strip() for c in df.columns]
+        # Bhavcopy values are space-padded (e.g. " RELIANCE ") — strip everything
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = df[col].astype(str).str.strip()
         return df
     return None
 
