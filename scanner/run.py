@@ -7,6 +7,7 @@ health score, writes ../data/stocks.json.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sys
 import time
@@ -16,7 +17,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from jugaad_data.nse import stock_df
+import requests
+
+# Enforce a default timeout on every HTTP GET — jugaad-data doesn't set one,
+# and a hung socket against NSE otherwise freezes the scanner indefinitely.
+_original_session_get = requests.Session.get
+def _session_get_with_timeout(self, url, **kwargs):
+    kwargs.setdefault("timeout", 15)
+    return _original_session_get(self, url, **kwargs)
+requests.Session.get = _session_get_with_timeout  # type: ignore[method-assign]
+
+from jugaad_data.nse import stock_df  # noqa: E402  (imported after monkey-patch)
 
 SCANNER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCANNER_DIR.parent
@@ -62,29 +73,40 @@ def load_universe() -> list[str]:
     return [s.strip() for s in UNIVERSE_FILE.read_text().splitlines() if s.strip()]
 
 
-def fetch_ohlcv(symbol: str) -> pd.DataFrame | None:
-    """Pull 1y daily OHLCV from NSE via jugaad-data. Returns columns Open/High/Low/Close/Volume."""
-    try:
-        end = date.today()
-        start = end - timedelta(days=400)  # extra buffer for holidays/weekends
-        df = stock_df(symbol=symbol, from_date=start, to_date=end, series="EQ")
-        if df is None or df.empty or len(df) < 60:
-            return None
-        df = df.rename(
-            columns={
-                "OPEN": "Open",
-                "HIGH": "High",
-                "LOW": "Low",
-                "CLOSE": "Close",
-                "VOLUME": "Volume",
-            }
-        )
-        df["DATE"] = pd.to_datetime(df["DATE"])
-        df = df.sort_values("DATE").reset_index(drop=True)
-        return df[["DATE", "Open", "High", "Low", "Close", "Volume"]].set_index("DATE")
-    except Exception as e:
-        print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
+def _fetch_inner(symbol: str) -> pd.DataFrame | None:
+    end = date.today()
+    start = end - timedelta(days=400)
+    df = stock_df(symbol=symbol, from_date=start, to_date=end, series="EQ")
+    if df is None or df.empty or len(df) < 60:
         return None
+    df = df.rename(
+        columns={
+            "OPEN": "Open",
+            "HIGH": "High",
+            "LOW": "Low",
+            "CLOSE": "Close",
+            "VOLUME": "Volume",
+        }
+    )
+    df["DATE"] = pd.to_datetime(df["DATE"])
+    df = df.sort_values("DATE").reset_index(drop=True)
+    return df[["DATE", "Open", "High", "Low", "Close", "Volume"]].set_index("DATE")
+
+
+def fetch_ohlcv(symbol: str, overall_timeout_s: int = 45) -> pd.DataFrame | None:
+    """Fetch with an overall per-symbol timeout. jugaad-data spawns its own
+    thread pool internally, and even with request-level timeouts the whole
+    operation can stall on chunk coordination — this outer watchdog bounds it."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_fetch_inner, symbol)
+        try:
+            return future.result(timeout=overall_timeout_s)
+        except concurrent.futures.TimeoutError:
+            print(f"  timeout fetching {symbol}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
+            return None
 
 
 def tier_for(score: int) -> str:
