@@ -1,4 +1,5 @@
-jugaad-data==0.29
+yfinance==0.2.51
+curl-cffi==0.7.4
 pandas==2.2.3
 numpy==1.26.4
 # pandas-ta added in Phase 3 for chart pattern detection.

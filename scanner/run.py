@@ -1,44 +1,32 @@
 """
 Chartles Phase 1 scanner.
 
-Pulls 1y of OHLCV for each symbol in universe/nifty50.txt via jugaad-data
-(direct NSE access, no API keys, no Yahoo dependency), computes a technical
-health score, writes ../data/stocks.json.
+Pulls 1y of OHLCV for each symbol via yfinance with curl_cffi browser
+impersonation (defeats Yahoo's TLS-fingerprint anti-scraping), computes a
+technical health score, writes ../data/stocks.json.
 """
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import sys
 import time
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
-
-# Enforce a default timeout on every HTTP GET — jugaad-data doesn't set one,
-# and a hung socket against NSE otherwise freezes the scanner indefinitely.
-_original_session_get = requests.Session.get
-def _session_get_with_timeout(self, url, **kwargs):
-    kwargs.setdefault("timeout", 15)
-    return _original_session_get(self, url, **kwargs)
-requests.Session.get = _session_get_with_timeout  # type: ignore[method-assign]
-
-from jugaad_data.nse import stock_df  # noqa: E402  (imported after monkey-patch)
+import yfinance as yf
+from curl_cffi import requests as curl_requests
 
 SCANNER_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCANNER_DIR.parent
 UNIVERSE_FILE = SCANNER_DIR / "universe" / "nifty50.txt"
 OUT_FILE = REPO_ROOT / "data" / "stocks.json"
 
-# jugaad-data has a cache-dir race in its thread pool (os.makedirs without exist_ok).
-# Pre-create the dirs so all worker threads find them already present.
-for _cache in ("nsehistory-stock", "nsehistory-index"):
-    (Path.home() / "Library" / "Caches" / _cache).mkdir(parents=True, exist_ok=True)
-    (Path.home() / ".cache" / _cache).mkdir(parents=True, exist_ok=True)
+# curl_cffi session with Chrome TLS fingerprint — lets yfinance through
+# Yahoo's anti-scraping which blocks vanilla urllib/requests.
+_session = curl_requests.Session(impersonate="chrome", timeout=15)
 
 TIERS = [
     (80, "Stable"),
@@ -73,40 +61,19 @@ def load_universe() -> list[str]:
     return [s.strip() for s in UNIVERSE_FILE.read_text().splitlines() if s.strip()]
 
 
-def _fetch_inner(symbol: str) -> pd.DataFrame | None:
-    end = date.today()
-    start = end - timedelta(days=400)
-    df = stock_df(symbol=symbol, from_date=start, to_date=end, series="EQ")
-    if df is None or df.empty or len(df) < 60:
+def fetch_ohlcv(symbol: str) -> pd.DataFrame | None:
+    """Pull 1y daily OHLCV from Yahoo via yfinance + curl_cffi (browser TLS)."""
+    try:
+        ticker = yf.Ticker(f"{symbol}.NS", session=_session)
+        df = ticker.history(period="1y", auto_adjust=True)
+        if df is None or df.empty or len(df) < 60:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
         return None
-    df = df.rename(
-        columns={
-            "OPEN": "Open",
-            "HIGH": "High",
-            "LOW": "Low",
-            "CLOSE": "Close",
-            "VOLUME": "Volume",
-        }
-    )
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    df = df.sort_values("DATE").reset_index(drop=True)
-    return df[["DATE", "Open", "High", "Low", "Close", "Volume"]].set_index("DATE")
-
-
-def fetch_ohlcv(symbol: str, overall_timeout_s: int = 45) -> pd.DataFrame | None:
-    """Fetch with an overall per-symbol timeout. jugaad-data spawns its own
-    thread pool internally, and even with request-level timeouts the whole
-    operation can stall on chunk coordination — this outer watchdog bounds it."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_fetch_inner, symbol)
-        try:
-            return future.result(timeout=overall_timeout_s)
-        except concurrent.futures.TimeoutError:
-            print(f"  timeout fetching {symbol}", file=sys.stderr)
-            return None
-        except Exception as e:
-            print(f"  fetch failed for {symbol}: {e}", file=sys.stderr)
-            return None
 
 
 def tier_for(score: int) -> str:
@@ -286,7 +253,7 @@ def main() -> int:
             failed.append(sym)
             continue
         rows.append(asdict(row))
-        time.sleep(0.4)  # be polite to yfinance/Yahoo
+        time.sleep(0.3)
 
     rows.sort(key=lambda r: r["score"], reverse=True)
 
